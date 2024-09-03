@@ -1,11 +1,21 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const fs = require('fs').promises;
+const path = require('path');
 
 class WhatsAppClient {
     constructor() {
-        // Inisialisasi client WhatsApp dengan LocalAuth dan pengaturan puppeteer
+        this.isAuthenticated = false;
+        this.qrCodeDisplayed = false;
+        this.initClient();
+    }
+
+    initClient() {
+        console.log('Initializing WhatsApp client...');
         this.client = new Client({
-            authStrategy: new LocalAuth(),
+            authStrategy: new LocalAuth({
+                dataPath: path.join(process.cwd(), '.wwebjs_auth')
+            }),
             puppeteer: {
                 args: [
                     '--no-sandbox', 
@@ -13,87 +23,157 @@ class WhatsAppClient {
                     '--disable-extensions', 
                     '--disable-dev-shm-usage'
                 ],
-                headless: true,  // Menggunakan headless mode untuk stabilitas lebih
+                headless: true,
             }
         });
 
-        // Panggil metode untuk menginisialisasi event listener
+        this.targetGroupId = '120363332560457535@g.us'; // Default group ID
         this.initializeClient();
     }
 
     initializeClient() {
-        // Event untuk menampilkan QR code di terminal
         this.client.on('qr', (qr) => {
-            console.log('QR RECEIVED');
+            console.log('New QR RECEIVED. Scan the QR code below:');
             qrcode.generate(qr, { small: true });
+            this.qrCodeDisplayed = true;
+            this.isAuthenticated = false;
         });
 
-        this.client.on('navigation', (navigation) => {
-          console.log('Navigation event:', navigation);
-          // Handle the navigation event here
-        });
-
-        // Event ketika client sudah siap digunakan
         this.client.on('ready', () => {
             console.log('Client is ready!');
+            this.isAuthenticated = true;
+            this.qrCodeDisplayed = false;
         });
 
-        // Event ketika client berhasil diautentikasi
         this.client.on('authenticated', () => {
             console.log('Client is authenticated!');
+            this.isAuthenticated = true;
+            this.qrCodeDisplayed = false;
         });
 
-        // Event ketika terjadi kegagalan autentikasi
-        this.client.on('auth_failure', (msg) => {
+        this.client.on('auth_failure', async (msg) => {
             console.error('Authentication failure:', msg);
+            this.isAuthenticated = false;
+            await this.handleLogout();
         });
 
-        // Event ketika client terputus
-        this.client.on('disconnected', (reason) => {
+        this.client.on('disconnected', async (reason) => {
             console.log('Client was disconnected:', reason);
-            // Opsional: Restart client jika diperlukan
-            this.client.initialize();
+            this.isAuthenticated = false;
+            await this.handleLogout();
         });
 
-        // Event untuk menangani perubahan status
-        this.client.on('change_state', (state) => {
-            console.log('Change state:', state);
-        });
-
-        // Event untuk menangani pesan yang masuk
         this.client.on('message', async (message) => {
-            try {
-                const from = message.from;
-                const to = '1234567890-1234567890@g.us';  // Ganti dengan ID grup Anda
-                await this.sendMessage(to, `Pesan dari ${from}: ${message.body}`);
-            } catch (error) {
-                console.error('Failed to handle message:', error);
+            console.log('Message received:', message.body, 'from:', message.from);
+            
+            if (message.body.toLowerCase() === '!getgroupid') {
+                await this.sendGroupList(message.from);
+            } else if (message.from !== this.targetGroupId) {
+                await this.forwardMessage(message);
             }
         });
     }
 
-    // Metode untuk menginisialisasi client
+    async handleLogout() {
+        console.log('Handling logout...');
+        try {
+            // Ensure the client is destroyed
+            if (this.client) {
+                await this.client.destroy();
+                console.log('Client destroyed');
+            }
+
+            // Wait for a moment to ensure all processes are complete
+            await new Promise(resolve => setTimeout(resolve, 5000));
+
+            // Delete session folder
+            const sessionDir = path.join(process.cwd(), '.wwebjs_auth');
+            await this.deleteFolderRecursive(sessionDir);
+            console.log('Session folder deleted');
+            
+            // Reset status
+            this.isAuthenticated = false;
+            this.qrCodeDisplayed = false;
+            
+            // Reinitialize client
+            this.initClient();
+            await this.initialize();
+        } catch (error) {
+            console.error('Error handling logout:', error);
+            // If deletion fails, try to reinitialize without deleting
+            this.initClient();
+            await this.initialize();
+        }
+    }
+
+    async deleteFolderRecursive(folderPath) {
+        try {
+            await fs.rm(folderPath, { recursive: true, force: true });
+        } catch (error) {
+            console.error(`Error deleting folder ${folderPath}:`, error);
+        }
+    }
+
     async initialize() {
+        console.log('Initializing client...');
         try {
             await this.client.initialize();
         } catch (error) {
             console.error('Error during client initialization:', error);
+            // If initialization fails, try to reinitialize
+            await this.handleLogout();
         }
     }
 
-    // Metode untuk mengirim pesan ke kontak atau grup
     async sendMessage(to, message) {
         try {
             await this.client.sendMessage(to, message);
-            console.log('Message sent successfully');
+            console.log('Message sent successfully to:', to);
         } catch (error) {
             console.error('Failed to send message:', error);
+            throw error; // Propagate the error for better handling in calling functions
         }
     }
 
-    // Metode untuk menambahkan event listener pada pesan yang masuk
-    onMessage(callback) {
-        this.client.on('message', callback);
+    async forwardMessage(message) {
+        try {
+            await this.sendMessage(this.targetGroupId, `${message.body}`);
+            console.log('Message forwarded to group');
+        } catch (error) {
+            console.error('Failed to forward message:', error);
+        }
+    }
+
+    async sendGroupList(to) {
+        try {
+            const chats = await this.client.getChats();
+            const groups = chats.filter(chat => chat.isGroup);
+            
+            if (groups.length > 0) {
+                let groupList = 'Daftar Grup yang Sudah Di-join:\n\n';
+                groups.forEach((group, index) => {
+                    groupList += `${index + 1}. Nama: ${group.name}\nID: ${group.id._serialized}\n\n`;
+                });
+                await this.sendMessage(to, groupList);
+            } else {
+                await this.sendMessage(to, 'Anda belum bergabung dengan grup apapun.');
+            }
+        } catch (error) {
+            console.error('Failed to send group list:', error);
+        }
+    }
+
+    getStatus() {
+        return {
+            isReady: this.client && this.client.pupPage ? true : false,
+            isAuthenticated: this.isAuthenticated,
+            targetGroupId: this.targetGroupId
+        };
+    }
+
+    async forceLogout() {
+        console.log('Forcing logout...');
+        await this.handleLogout();
     }
 }
 
